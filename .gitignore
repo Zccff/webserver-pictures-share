@@ -1,0 +1,36 @@
+# IDE and local tooling
+.vs/
+.vscode/
+.idea/
+
+# CMake and compiler output
+build/
+out/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+compile_commands.json
+a.out
+*.o
+*.obj
+*.exe
+*.pdb
+
+# Logs and runtime state
+*.log
+*.pid
+
+# Docker image exports and deployment archives
+*.tar
+*.tar.gz
+
+# Local environment and credentials
+.env
+.env.*
+!.env.example
+
+# Local scratch files
+root@*
+新建 文本文档.txt

@@ -1,0 +1,85 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>图片账户管理</title>
+    <style>
+        * { box-sizing: border-box; }
+        body { margin:0; background:#f5f7fa; color:#1f2933; font-family:Arial,"Microsoft YaHei",sans-serif; line-height:1.5; }
+        header { background:#fff; border-bottom:1px solid #d9e2ec; }
+        .topbar { max-width:1180px; margin:0 auto; padding:18px 20px; display:flex; justify-content:space-between; align-items:center; gap:16px; }
+        .brand strong { display:block; font-size:20px; }
+        .brand span { color:#627d98; font-size:13px; }
+        .status-line { display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-end; }
+        .status-pill { border:1px solid #bcccdc; border-radius:6px; background:#f8fafc; color:#52606d; padding:7px 10px; font-size:13px; }
+        main { max-width:1180px; margin:0 auto; padding:24px 20px 42px; }
+        .layout { display:grid; grid-template-columns:360px 1fr; gap:20px; align-items:start; }
+        .panel { background:#fff; border:1px solid #d9e2ec; border-radius:8px; overflow:hidden; }
+        .panel-header { padding:16px 18px; border-bottom:1px solid #e4e7eb; }
+        .panel-header h1,.panel-header h2 { margin:0; font-size:18px; }
+        .panel-header p { margin:6px 0 0; color:#627d98; font-size:13px; }
+        .panel-body { padding:18px; }
+        .tabs { display:grid; grid-template-columns:1fr 1fr; border:1px solid #bcccdc; border-radius:6px; overflow:hidden; margin-bottom:16px; }
+        .tab-button { border:0; background:#fff; color:#52606d; cursor:pointer; padding:10px 12px; font-size:14px; }
+        .tab-button.active { background:#1f4e79; color:#fff; }
+        .form { display:none; }
+        .form.active { display:block; }
+        .field { margin-bottom:13px; }
+        label { display:block; color:#334e68; font-size:13px; font-weight:600; margin-bottom:6px; }
+        input { width:100%; height:40px; border:1px solid #bcccdc; border-radius:6px; padding:0 10px; font:inherit; background:#fff; color:#1f2933; }
+        input[type=file] { height:auto; padding:9px; }
+        input:focus { border-color:#1f4e79; outline:2px solid #d9eefe; outline-offset:0; }
+        .button { width:100%; height:42px; border:0; border-radius:6px; background:#1f4e79; color:#fff; cursor:pointer; font:inherit; font-weight:700; }
+        .button.secondary { background:#334e68; }
+        .button:disabled,.link-button:disabled { opacity:.65; cursor:not-allowed; }
+        .message { margin-top:12px; min-height:38px; border-radius:6px; padding:10px; background:#f0f4f8; color:#52606d; font-size:13px; }
+        .message.ok { color:#0f5132; background:#d1e7dd; }
+        .message.error { color:#842029; background:#f8d7da; }
+        .account { display:flex; justify-content:space-between; gap:16px; align-items:center; margin-bottom:18px; padding:12px; background:#f8fafc; border:1px solid #d9e2ec; border-radius:8px; }
+        .account strong,.account span { display:block; }
+        .account span { color:#627d98; font-size:13px; margin-top:2px; }
+        .link-button { border:1px solid #bcccdc; border-radius:6px; background:#fff; color:#334e68; cursor:pointer; padding:8px 10px; font:inherit; font-size:13px; text-decoration:none; display:inline-flex; align-items:center; justify-content:center; min-height:36px; }
+        .upload-panel { border:1px solid #d9e2ec; background:#f8fafc; border-radius:8px; padding:14px; margin-bottom:16px; }
+        .upload-row { display:grid; grid-template-columns:1fr 120px; gap:10px; align-items:end; }
+        .toolbar { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:14px; }
+        .toolbar p { margin:0; color:#627d98; font-size:13px; }
+        .gallery-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:14px; }
+        .image-card { border:1px solid #d9e2ec; border-radius:8px; background:#fff; overflow:hidden; }
+        .image-card button { display:block; width:100%; border:0; padding:0; background:transparent; cursor:pointer; }
+        .image-card img { display:block; width:100%; aspect-ratio:4/3; object-fit:cover; background:#e4e7eb; }
+        .image-card figcaption { padding:10px; color:#334e68; font-size:13px; word-break:break-all; }
+        .image-actions { display:grid; grid-template-columns:1fr 1fr; gap:8px; padding:0 10px 10px; }
+        .empty { border:1px dashed #bcccdc; border-radius:8px; padding:28px; color:#627d98; text-align:center; grid-column:1/-1; }
+        .modal { position:fixed; inset:0; display:none; align-items:center; justify-content:center; background:rgba(15,23,42,.72); padding:24px; z-index:10; }
+        .modal.open { display:flex; }
+        .modal-content { max-width:min(920px,100%); width:100%; background:#fff; border-radius:8px; overflow:hidden; }
+        .modal-header { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:12px 14px; border-bottom:1px solid #d9e2ec; }
+        .modal-header strong { word-break:break-all; }
+        .modal-body { background:#0f172a; }
+        .modal-body img { display:block; width:100%; max-height:78vh; object-fit:contain; }
+        @media (max-width:900px) { .layout { grid-template-columns:1fr; } .topbar { flex-direction:column; align-items:flex-start; } .status-line { justify-content:flex-start; } }
+        @media (max-width:620px) { .gallery-grid { grid-template-columns:1fr; } .upload-row { grid-template-columns:1fr; } }
+    </style>
+</head>
+<body>
+<header><div class="topbar"><div class="brand"><strong>图片账户管理</strong><span>C++ WebServer + MySQL 用户 + Redis Session + 图片上传下载</span></div><div class="status-line"><div id="dbStatus" class="status-pill">MySQL 状态加载中</div><div id="sessionStatus" class="status-pill">Redis 状态加载中</div></div></div></header>
+<main><div class="layout"><section class="panel"><div class="panel-header"><h1>账号入口</h1><p>注册写入 MySQL，登录状态写入 Redis。</p></div><div class="panel-body"><div class="tabs"><button id="registerTab" class="tab-button active" type="button">注册</button><button id="loginTab" class="tab-button" type="button">登录</button></div><form id="registerForm" class="form active"><div class="field"><label for="registerUsername">用户名</label><input id="registerUsername" name="username" autocomplete="username" required maxlength="64"></div><div class="field"><label for="registerPassword">密码</label><input id="registerPassword" name="password" type="password" autocomplete="new-password" required minlength="6" maxlength="64"></div><div class="field"><label for="displayName">显示名称</label><input id="displayName" name="display_name" maxlength="64"></div><div class="field"><label for="email">邮箱</label><input id="email" name="email" type="email" maxlength="128"></div><button class="button" type="submit">登记注册</button></form><form id="loginForm" class="form"><div class="field"><label for="loginUsername">用户名</label><input id="loginUsername" name="username" autocomplete="username" required maxlength="64"></div><div class="field"><label for="loginPassword">密码</label><input id="loginPassword" name="password" type="password" autocomplete="current-password" required maxlength="64"></div><button class="button secondary" type="submit">登录</button></form><div id="formMessage" class="message">填写信息后提交。</div></div></section><section class="panel"><div class="panel-header"><h2>图片浏览</h2><p>登录后可以上传、预览、下载服务器图片。</p></div><div class="panel-body"><div class="account"><div><strong id="accountTitle">未登录</strong><span id="accountSubtitle">请先登录，图片功能会在登录后解锁。</span></div><button id="logoutButton" class="link-button" type="button" hidden>退出登录</button></div><form id="uploadForm" class="upload-panel"><div class="upload-row"><div><label for="imageFile">上传图片</label><input id="imageFile" name="image" type="file" accept=".png,.jpg,.jpeg,.webp,.gif,image/*" disabled></div><button id="uploadButton" class="button" type="submit" disabled>上传</button></div></form><div class="toolbar"><p id="imageCount">图片区已锁定</p><button id="refreshImages" class="link-button" type="button" disabled>刷新图片</button></div><div id="gallery" class="gallery-grid"></div></div></section></div></main>
+<div id="imageModal" class="modal" aria-hidden="true"><div class="modal-content"><div class="modal-header"><strong id="modalTitle"></strong><button id="closeModal" class="link-button" type="button">关闭</button></div><div class="modal-body"><img id="modalImage" alt=""></div></div></div>
+<script>
+const $=(id)=>document.getElementById(id);const registerTab=$('registerTab'),loginTab=$('loginTab'),registerForm=$('registerForm'),loginForm=$('loginForm'),uploadForm=$('uploadForm'),imageFile=$('imageFile'),uploadButton=$('uploadButton'),formMessage=$('formMessage'),dbStatus=$('dbStatus'),sessionStatus=$('sessionStatus'),accountTitle=$('accountTitle'),accountSubtitle=$('accountSubtitle'),gallery=$('gallery'),imageCount=$('imageCount'),refreshImages=$('refreshImages'),logoutButton=$('logoutButton'),imageModal=$('imageModal'),modalTitle=$('modalTitle'),modalImage=$('modalImage'),closeModal=$('closeModal');
+function setActiveTab(tab){const r=tab==='register';registerTab.classList.toggle('active',r);loginTab.classList.toggle('active',!r);registerForm.classList.toggle('active',r);loginForm.classList.toggle('active',!r);setMessage('填写信息后提交。')}
+function setMessage(text,type){formMessage.textContent=text;formMessage.className='message';if(type)formMessage.classList.add(type)}
+function setLoggedOut(){accountTitle.textContent='未登录';accountSubtitle.textContent='请先登录，图片功能会在登录后解锁。';imageCount.textContent='图片区已锁定';refreshImages.disabled=true;imageFile.disabled=true;uploadButton.disabled=true;logoutButton.hidden=true;gallery.innerHTML='<div class="empty">登录后可以查看、上传和下载图片。</div>'}
+function setLoggedIn(user){accountTitle.textContent='已登录：'+user.display_name;accountSubtitle.textContent='用户名：'+user.username;refreshImages.disabled=false;imageFile.disabled=false;uploadButton.disabled=false;logoutButton.hidden=false}
+async function submitForm(url,form){const button=form.querySelector('button[type="submit"]');button.disabled=true;setMessage('正在提交...');try{const response=await fetch(url,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8','Accept':'application/json'},body:new URLSearchParams(new FormData(form)).toString()});const data=await response.json();if(!response.ok||!data.ok){setMessage(data.message||'请求失败。','error');return null}setMessage(data.message||'操作成功。','ok');return data}catch(e){setMessage('请求失败，服务器可能没有启动。','error');return null}finally{button.disabled=false}}
+async function loadStatus(){await Promise.all([fetch('/api/db-status').then(r=>r.json()).then(d=>{dbStatus.textContent=d.available?'MySQL 已连接':'MySQL 不可用：'+d.message}).catch(()=>{dbStatus.textContent='MySQL 状态无法获取'}),fetch('/api/session-status').then(r=>r.json()).then(d=>{sessionStatus.textContent=d.available?'Redis 已连接':'Redis 不可用：'+d.message}).catch(()=>{sessionStatus.textContent='Redis 状态无法获取'})])}
+async function loadMe(){try{const response=await fetch('/api/me',{headers:{'Accept':'application/json'}});const data=await response.json();if(!response.ok||!data.ok){setLoggedOut();return}setLoggedIn(data.user);await loadImages()}catch(e){setLoggedOut()}}
+async function loadImages(){imageCount.textContent='正在加载图片';gallery.innerHTML='';try{const response=await fetch('/api/images',{headers:{'Accept':'application/json'}});const data=await response.json();if(!response.ok||!data.ok){setLoggedOut();setMessage(data.message||'请先登录。','error');return}const images=data.images||[];imageCount.textContent=images.length+' 张图片';if(images.length===0){gallery.innerHTML='<div class="empty">还没有图片，可以先上传一张。</div>';return}for(const image of images){const figure=document.createElement('figure');figure.className='image-card';const preview=document.createElement('button');preview.type='button';preview.addEventListener('click',()=>openImage(image));const img=document.createElement('img');img.src=image.url;img.alt=image.name;img.loading='lazy';preview.appendChild(img);const caption=document.createElement('figcaption');caption.textContent=image.name;const actions=document.createElement('div');actions.className='image-actions';const openButton=document.createElement('button');openButton.className='link-button';openButton.type='button';openButton.textContent='查看';openButton.addEventListener('click',()=>openImage(image));const download=document.createElement('a');download.className='link-button';download.href=image.download_url||image.url;download.textContent='下载';actions.appendChild(openButton);actions.appendChild(download);figure.appendChild(preview);figure.appendChild(caption);figure.appendChild(actions);gallery.appendChild(figure)}}catch(e){gallery.innerHTML='<div class="empty">图片列表加载失败。</div>';imageCount.textContent='加载失败'}}
+async function uploadImage(event){event.preventDefault();if(!imageFile.files||imageFile.files.length===0){setMessage('请选择一张图片。','error');return}const file=imageFile.files[0];if(file.size>6*1024*1024){setMessage('图片不能超过 6MB。','error');return}uploadButton.disabled=true;setMessage('正在上传图片...');try{const body=new FormData();body.append('image',file);const response=await fetch('/api/upload-image',{method:'POST',body});const data=await response.json();if(!response.ok||!data.ok){setMessage(data.message||'上传失败。','error');return}imageFile.value='';setMessage('图片上传成功。','ok');await loadImages()}catch(e){setMessage('上传失败，服务器可能没有启动。','error')}finally{uploadButton.disabled=false}}
+function openImage(image){modalTitle.textContent=image.name;modalImage.src=image.url;modalImage.alt=image.name;imageModal.classList.add('open');imageModal.setAttribute('aria-hidden','false')}
+function closeImage(){imageModal.classList.remove('open');imageModal.setAttribute('aria-hidden','true');modalImage.src=''}
+registerTab.addEventListener('click',()=>setActiveTab('register'));loginTab.addEventListener('click',()=>setActiveTab('login'));refreshImages.addEventListener('click',loadImages);uploadForm.addEventListener('submit',uploadImage);closeModal.addEventListener('click',closeImage);imageModal.addEventListener('click',(event)=>{if(event.target===imageModal)closeImage()});logoutButton.addEventListener('click',async()=>{await fetch('/api/logout',{method:'POST',headers:{'Accept':'application/json'}}).catch(()=>{});setLoggedOut();setMessage('已退出登录。')});registerForm.addEventListener('submit',async(event)=>{event.preventDefault();const data=await submitForm('/api/register',registerForm);if(data){registerForm.reset();setActiveTab('login');setMessage('注册完成，请登录后使用图片功能。','ok')}});loginForm.addEventListener('submit',async(event)=>{event.preventDefault();const data=await submitForm('/api/login',loginForm);if(data&&data.user){setLoggedIn(data.user);loginForm.reset();await loadImages()}});setLoggedOut();loadStatus();loadMe();
+</script>
+</body>
+</html>

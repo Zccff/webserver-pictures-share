@@ -1,0 +1,14 @@
+.git
+.vs
+build
+out
+server.log
+*.log
+a.out
+docs
+.git
+.gitignore
+build/
+*.tar
+*.tar.gz
+webroot-seed

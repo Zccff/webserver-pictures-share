@@ -1,0 +1,83 @@
+services:
+  mysql:
+    image: mysql:8.4
+    container_name: mywebserver-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: root123456
+      MYSQL_DATABASE: my_web_server
+      MYSQL_USER: webuser
+      MYSQL_PASSWORD: 123456
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot123456"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    container_name: mywebserver-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  app:
+    image: mywebserver-app:opt-v4
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        APT_MIRROR: ${APT_MIRROR:-http://mirrors.aliyun.com/ubuntu}
+    container_name: mywebserver-app
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+      MYSQL_USER: webuser
+      MYSQL_PASSWORD: 123456
+      MYSQL_DATABASE: my_web_server
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      SESSION_TTL_SECONDS: 86400
+      SESSION_CACHE_TTL_SECONDS: 3
+      LOGIN_CACHE_TTL_SECONDS: 3
+      REDIS_POOL_SIZE: 8
+      MYSQL_POOL_SIZE: 8
+      X_ACCEL_REDIRECT: 1
+      MYWEBSERVER_LOG_LEVEL: WARN
+      IMAGE_LIST_CACHE_TTL_SECONDS: 1
+    volumes:
+      - image_data:/app/webroot/images
+    expose:
+      - "9006"
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: mywebserver-nginx
+    restart: unless-stopped
+    depends_on:
+      - app
+    ports:
+      - "8080:80"
+    volumes:
+      - ./deploy/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./webroot:/usr/share/nginx/mywebserver:ro
+      - image_data:/usr/share/nginx/protected-images:ro
+
+volumes:
+  mysql_data:
+  redis_data:
+  image_data:
