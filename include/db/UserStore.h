@@ -3,15 +3,27 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
+enum class UserResultStatus {
+    Ok,
+    InvalidInput,
+    InvalidCredentials,
+    Conflict,
+    Cancelled,
+    Unavailable,
+    Error
+};
+
 struct RegisterResult {
     bool ok{ false };
     std::string message;
+    UserResultStatus status{ UserResultStatus::Error };
 };
 
 struct LoginResult {
@@ -19,6 +31,36 @@ struct LoginResult {
     std::string message;
     std::string username;
     std::string display_name;
+    UserResultStatus status{ UserResultStatus::Error };
+};
+
+enum class ImageReserveStatus {
+    Ok,
+    Duplicate,
+    LimitExceeded,
+    Cancelled,
+    Unavailable,
+    Error
+};
+
+struct ImageReserveResult {
+    ImageReserveStatus status{ ImageReserveStatus::Error };
+    std::string message;
+};
+
+enum class ImageDeleteStatus {
+    Ok,
+    NotFound,
+    Forbidden,
+    Cancelled,
+    CommitUnknown,
+    Unavailable,
+    Error
+};
+
+struct ImageDeleteResult {
+    ImageDeleteStatus status{ ImageDeleteStatus::Error };
+    std::string message;
 };
 
 #ifdef MYWEBSERVER_WITH_MYSQL
@@ -41,13 +83,38 @@ public:
         const std::string& username,
         const std::string& password,
         const std::string& display_name,
-        const std::string& email
+        const std::string& email,
+        const std::shared_ptr<std::atomic<bool>>& cancelled = nullptr
     );
 
     LoginResult login_user(
         const std::string& username,
         const std::string& password
     );
+
+    ImageReserveResult reserve_image(
+        const std::string& username,
+        const std::string& stored_name,
+        const std::string& original_name,
+        const std::string& content_hash,
+        uint64_t size_bytes,
+        size_t max_images,
+        const std::shared_ptr<std::atomic<bool>>& cancelled
+    );
+
+    ImageDeleteResult check_image_owner(
+        const std::string& username,
+        const std::string& stored_name,
+        const std::shared_ptr<std::atomic<bool>>& cancelled = nullptr
+    );
+
+    ImageDeleteResult delete_owned_image(
+        const std::string& username,
+        const std::string& stored_name,
+        const std::shared_ptr<std::atomic<bool>>& cancelled = nullptr
+    );
+
+    static std::string sha256(const std::string& value);
 
 private:
     UserStore() = default;
@@ -117,6 +184,7 @@ private:
     unsigned int port_{ 3306 };
     size_t pool_size_{ 8 };
     size_t min_healthy_connections_{ 4 };
+    int pool_wait_timeout_ms_{ 100 };
 
     std::vector<MysqlConnection*> all_connections_;
     std::atomic<size_t> next_connection_{ 0 };
@@ -125,6 +193,7 @@ private:
 #endif
 
     int login_cache_ttl_seconds_{ 3 };
+    size_t login_cache_capacity_{ 10000 };
     mutable std::shared_mutex login_cache_mutex_;
     mutable std::unordered_map<std::string, CachedLoginUser> login_cache_;
 };

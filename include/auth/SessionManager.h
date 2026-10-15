@@ -1,5 +1,7 @@
 #pragma once
 
+#include "auth/SessionInfo.h"
+
 #include <atomic>
 #include <chrono>
 #include <initializer_list>
@@ -9,11 +11,6 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
-
-struct SessionInfo {
-    std::string username;
-    std::string display_name;
-};
 
 class SessionManager {
 public:
@@ -54,8 +51,6 @@ private:
         const std::initializer_list<std::string>& args,
         std::string& response
     ) const;
-
-    RedisConnection* pick_connection() const;
 
     bool connect_locked(RedisConnection& connection) const;
 
@@ -108,6 +103,8 @@ private:
     mutable std::atomic<size_t> next_connection_{ 0 };
 
     int cache_ttl_seconds_{ 3 };
+    size_t cache_capacity_{ 20000 };
+    int io_timeout_ms_{ 3000 };
     mutable std::shared_mutex cache_mutex_;
     mutable std::unordered_map<std::string, CachedSession> session_cache_;
 };

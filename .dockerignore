@@ -2,6 +2,7 @@
 .vs
 build
 out
+dist
 server.log
 *.log
 a.out
@@ -11,4 +12,5 @@ docs
 build/
 *.tar
 *.tar.gz
+root@*
 webroot-seed

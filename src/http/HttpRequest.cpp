@@ -11,6 +11,7 @@ bool HttpRequest::parse(const std::string& raw_request) {
     body_.clear();
     headers_.clear();
     valid_ = false;
+    streamed_upload_.reset();
 
     std::istringstream stream(raw_request);
 
@@ -28,7 +29,9 @@ bool HttpRequest::parse(const std::string& raw_request) {
 
     request_line >> method_ >> path_ >> version_;
 
-    if (method_.empty() || path_.empty() || version_.empty()) {
+    std::string trailing_request_token;
+    if (method_.empty() || path_.empty() || version_.empty() ||
+        (request_line >> trailing_request_token)) {
         return false;
     }
 
@@ -44,11 +47,22 @@ bool HttpRequest::parse(const std::string& raw_request) {
         size_t colon_pos = line.find(':');
 
         if (colon_pos == std::string::npos) {
-            continue;
+            return false;
         }
 
         std::string key = to_lower(trim(line.substr(0, colon_pos)));
         std::string value = trim(line.substr(colon_pos + 1));
+
+        if (key.empty()) {
+            return false;
+        }
+        // This server only implements fixed-length request bodies. Rejecting
+        // Transfer-Encoding and duplicate Content-Length keeps the parser and
+        // the connection framing code on one unambiguous message boundary.
+        if (key == "transfer-encoding" ||
+            (key == "content-length" && headers_.count(key) != 0)) {
+            return false;
+        }
 
         headers_[key] = value;
     }

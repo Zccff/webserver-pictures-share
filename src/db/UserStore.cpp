@@ -200,6 +200,11 @@ struct MysqlConnection {
     MYSQL* mysql{ nullptr };
     MYSQL_STMT* register_stmt{ nullptr };
     MYSQL_STMT* login_stmt{ nullptr };
+    MYSQL_STMT* image_lock_user_stmt{ nullptr };
+    MYSQL_STMT* image_count_stmt{ nullptr };
+    MYSQL_STMT* image_insert_stmt{ nullptr };
+    MYSQL_STMT* image_owner_stmt{ nullptr };
+    MYSQL_STMT* image_delete_stmt{ nullptr };
     std::atomic<bool> in_use{ false };
     std::atomic<bool> healthy{ false };
 };
@@ -208,6 +213,10 @@ struct MysqlConnection {
 UserStore& UserStore::instance() {
     static UserStore store;
     return store;
+}
+
+std::string UserStore::sha256(const std::string& value) {
+    return sha256_hex(value);
 }
 
 UserStore::~UserStore() {
@@ -242,6 +251,10 @@ bool UserStore::init_from_env() {
         min_healthy_connections_ = (pool_size_ + 1) / 2;
         login_cache_ttl_seconds_ = static_cast<int>(
             env_size_or_default("LOGIN_CACHE_TTL_SECONDS", 3)
+        );
+        login_cache_capacity_ = env_size_or_default("LOGIN_CACHE_CAPACITY", 10000);
+        pool_wait_timeout_ms_ = static_cast<int>(
+            env_size_or_default("MYSQL_POOL_WAIT_TIMEOUT_MS", 100)
         );
 
         if (!is_safe_identifier(database_)) {
@@ -396,6 +409,24 @@ void UserStore::put_cached_login_user(
 
     std::unique_lock<std::shared_mutex> lock(login_cache_mutex_);
 
+    if (login_cache_.size() >= login_cache_capacity_ &&
+        login_cache_.find(username) == login_cache_.end()) {
+        auto now = std::chrono::steady_clock::now();
+
+        for (auto it = login_cache_.begin(); it != login_cache_.end();) {
+            if (now >= it->second.expires_at) {
+                it = login_cache_.erase(it);
+            }
+            else {
+                ++it;
+            }
+        }
+
+        if (login_cache_.size() >= login_cache_capacity_) {
+            login_cache_.erase(login_cache_.begin());
+        }
+    }
+
     login_cache_[username] = {
         normalize_hash(password_hash),
         display_name,
@@ -417,27 +448,46 @@ RegisterResult UserStore::register_user(
     const std::string& username,
     const std::string& password,
     const std::string& display_name,
-    const std::string& email
+    const std::string& email,
+    const std::shared_ptr<std::atomic<bool>>& cancelled
 ) {
     if (username.empty() || password.empty()) {
-        return { false, "username and password are required" };
+        return {
+            false,
+            "username and password are required",
+            UserResultStatus::InvalidInput
+        };
     }
 
 #ifdef MYWEBSERVER_WITH_MYSQL
+    auto is_cancelled = [&cancelled]() {
+        return cancelled && cancelled->load(std::memory_order_acquire);
+    };
+
+    if (is_cancelled()) {
+        return { false, "request was cancelled", UserResultStatus::Cancelled };
+    }
+
     MysqlConnection* connection = acquire_connection();
 
     if (!connection) {
-        return { false, status_message() };
+        return { false, status_message(), UserResultStatus::Unavailable };
     }
 
     MYSQL_STMT* stmt = connection->register_stmt;
 
+    auto fail = [&](unsigned int error_no, const std::string& error) {
+        mysql_rollback(connection->mysql);
+        mysql_autocommit(connection->mysql, 1);
+        handle_connection_failure(connection, error_no, error);
+        release_connection(connection);
+        return RegisterResult{ false, error, UserResultStatus::Error };
+    };
+
     if (mysql_stmt_reset(stmt)) {
         unsigned int error_no = mysql_stmt_errno(stmt);
         std::string error = mysql_stmt_error(stmt);
-        handle_connection_failure(connection, error_no, error);
-        release_connection(connection);
-        return { false, error };
+        return fail(error_no, error);
     }
 
     std::string safe_display_name = display_name.empty() ? username : display_name;
@@ -468,29 +518,60 @@ RegisterResult UserStore::register_user(
     if (mysql_stmt_bind_param(stmt, bind)) {
         unsigned int error_no = mysql_stmt_errno(stmt);
         std::string error = mysql_stmt_error(stmt);
-        handle_connection_failure(connection, error_no, error);
+        return fail(error_no, error);
+    }
+
+    if (mysql_autocommit(connection->mysql, 0)) {
+        unsigned int error_no = mysql_errno(connection->mysql);
+        std::string error = mysql_error(connection->mysql);
+        return fail(error_no, error);
+    }
+
+    if (is_cancelled()) {
+        mysql_rollback(connection->mysql);
+        mysql_autocommit(connection->mysql, 1);
         release_connection(connection);
-        return { false, error };
+        return { false, "request was cancelled", UserResultStatus::Cancelled };
     }
 
     if (mysql_stmt_execute(stmt)) {
         unsigned int error_no = mysql_stmt_errno(stmt);
         std::string error = mysql_stmt_error(stmt);
+        mysql_rollback(connection->mysql);
+        mysql_autocommit(connection->mysql, 1);
         handle_connection_failure(connection, error_no, error);
         release_connection(connection);
 
         if (error_no == 1062) {
-            return { false, "username already exists" };
+            return {
+                false,
+                "username already exists",
+                UserResultStatus::Conflict
+            };
         }
 
-        return { false, error };
+        return { false, error, UserResultStatus::Error };
+    }
+
+    if (is_cancelled()) {
+        mysql_rollback(connection->mysql);
+        mysql_autocommit(connection->mysql, 1);
+        release_connection(connection);
+        return { false, "request was cancelled", UserResultStatus::Cancelled };
+    }
+
+    if (mysql_commit(connection->mysql) || mysql_autocommit(connection->mysql, 1)) {
+        unsigned int error_no = mysql_errno(connection->mysql);
+        std::string error = mysql_error(connection->mysql);
+        return fail(error_no, error);
     }
 
     release_connection(connection);
     put_cached_login_user(username, password_hash, safe_display_name);
-    return { true, "registered" };
+    return { true, "registered", UserResultStatus::Ok };
 #else
-    return { false, status_message() };
+    (void)cancelled;
+    return { false, status_message(), UserResultStatus::Unavailable };
 #endif
 }
 
@@ -499,7 +580,13 @@ LoginResult UserStore::login_user(
     const std::string& password
 ) {
     if (username.empty() || password.empty()) {
-        return { false, "username and password are required", "", "" };
+        return {
+            false,
+            "username and password are required",
+            "",
+            "",
+            UserResultStatus::InvalidInput
+        };
     }
 
 #ifdef MYWEBSERVER_WITH_MYSQL
@@ -508,16 +595,34 @@ LoginResult UserStore::login_user(
 
     if (get_cached_login_user(username, cached_user)) {
         if (!constant_time_equal(cached_user.password_hash, expected_hash)) {
-            return { false, "invalid username or password", "", "" };
+            return {
+                false,
+                "invalid username or password",
+                "",
+                "",
+                UserResultStatus::InvalidCredentials
+            };
         }
 
-        return { true, "logged in", username, cached_user.display_name };
+        return {
+            true,
+            "logged in",
+            username,
+            cached_user.display_name,
+            UserResultStatus::Ok
+        };
     }
 
     MysqlConnection* connection = acquire_connection();
 
     if (!connection) {
-        return { false, status_message(), "", "" };
+        return {
+            false,
+            status_message(),
+            "",
+            "",
+            UserResultStatus::Unavailable
+        };
     }
 
     MYSQL_STMT* stmt = connection->login_stmt;
@@ -527,7 +632,7 @@ LoginResult UserStore::login_user(
         std::string error = mysql_stmt_error(stmt);
         handle_connection_failure(connection, error_no, error);
         release_connection(connection);
-        return { false, error, "", "" };
+        return { false, error, "", "", UserResultStatus::Error };
     }
 
     MYSQL_BIND bind[1]{};
@@ -548,7 +653,7 @@ LoginResult UserStore::login_user(
         std::string error = mysql_stmt_error(stmt);
         handle_connection_failure(connection, error_no, error);
         release_connection(connection);
-        return { false, error, "", "" };
+        return { false, error, "", "", UserResultStatus::Error };
     }
 
     if (mysql_stmt_execute(stmt)) {
@@ -556,7 +661,7 @@ LoginResult UserStore::login_user(
         std::string error = mysql_stmt_error(stmt);
         handle_connection_failure(connection, error_no, error);
         release_connection(connection);
-        return { false, error, "", "" };
+        return { false, error, "", "", UserResultStatus::Error };
     }
 
     char username_buf[256]{};
@@ -585,7 +690,7 @@ LoginResult UserStore::login_user(
         std::string error = mysql_stmt_error(stmt);
         handle_connection_failure(connection, error_no, error);
         release_connection(connection);
-        return { false, error, "", "" };
+        return { false, error, "", "", UserResultStatus::Error };
     }
 
     int fetch_status = mysql_stmt_fetch(stmt);
@@ -593,7 +698,13 @@ LoginResult UserStore::login_user(
     if (fetch_status == MYSQL_NO_DATA) {
         mysql_stmt_free_result(stmt);
         release_connection(connection);
-        return { false, "invalid username or password", "", "" };
+        return {
+            false,
+            "invalid username or password",
+            "",
+            "",
+            UserResultStatus::InvalidCredentials
+        };
     }
 
     if (fetch_status != 0 && fetch_status != MYSQL_DATA_TRUNCATED) {
@@ -602,7 +713,7 @@ LoginResult UserStore::login_user(
         mysql_stmt_free_result(stmt);
         handle_connection_failure(connection, error_no, error);
         release_connection(connection);
-        return { false, error, "", "" };
+        return { false, error, "", "", UserResultStatus::Error };
     }
 
     std::string result_username(username_buf, result_lengths[0]);
@@ -617,12 +728,470 @@ LoginResult UserStore::login_user(
     put_cached_login_user(result_username, stored_hash, result_display_name);
 
     if (!constant_time_equal(stored_hash, expected_hash)) {
-        return { false, "invalid username or password", "", "" };
+        return {
+            false,
+            "invalid username or password",
+            "",
+            "",
+            UserResultStatus::InvalidCredentials
+        };
     }
 
-    return { true, "logged in", result_username, result_display_name };
+    return {
+        true,
+        "logged in",
+        result_username,
+        result_display_name,
+        UserResultStatus::Ok
+    };
 #else
-    return { false, status_message(), "", "" };
+    return {
+        false,
+        status_message(),
+        "",
+        "",
+        UserResultStatus::Unavailable
+    };
+#endif
+}
+
+ImageReserveResult UserStore::reserve_image(
+    const std::string& username,
+    const std::string& stored_name,
+    const std::string& original_name,
+    const std::string& content_hash,
+    uint64_t size_bytes,
+    size_t max_images,
+    const std::shared_ptr<std::atomic<bool>>& cancelled
+) {
+#ifdef MYWEBSERVER_WITH_MYSQL
+    auto is_cancelled = [&cancelled]() {
+        return cancelled && cancelled->load(std::memory_order_acquire);
+    };
+
+    if (is_cancelled()) {
+        return { ImageReserveStatus::Cancelled, "request was cancelled" };
+    }
+
+    MysqlConnection* connection = acquire_connection();
+
+    if (!connection) {
+        return { ImageReserveStatus::Unavailable, "database pool is busy or unavailable" };
+    }
+
+    auto fail = [&](MYSQL_STMT* stmt, const std::string& prefix) {
+        unsigned int error_no = stmt ? mysql_stmt_errno(stmt) : mysql_errno(connection->mysql);
+        std::string error = stmt ? mysql_stmt_error(stmt) : mysql_error(connection->mysql);
+        mysql_rollback(connection->mysql);
+        mysql_autocommit(connection->mysql, 1);
+        handle_connection_failure(connection, error_no, error);
+        release_connection(connection);
+        return ImageReserveResult{
+            ImageReserveStatus::Error,
+            prefix + (error.empty() ? "mysql operation failed" : error)
+        };
+    };
+
+    if (mysql_autocommit(connection->mysql, 0)) {
+        return fail(nullptr, "start image transaction failed: ");
+    }
+
+    auto cancel_transaction = [&]() {
+        mysql_rollback(connection->mysql);
+        mysql_autocommit(connection->mysql, 1);
+        release_connection(connection);
+        return ImageReserveResult{
+            ImageReserveStatus::Cancelled,
+            "request was cancelled"
+        };
+    };
+
+    if (is_cancelled()) {
+        return cancel_transaction();
+    }
+
+    MYSQL_STMT* lock_user = connection->image_lock_user_stmt;
+    mysql_stmt_reset(lock_user);
+    MYSQL_BIND user_param[1]{};
+    unsigned long username_length = static_cast<unsigned long>(username.size());
+    user_param[0].buffer_type = MYSQL_TYPE_STRING;
+    user_param[0].buffer = const_cast<char*>(username.data());
+    user_param[0].buffer_length = username_length;
+    user_param[0].length = &username_length;
+
+    if (mysql_stmt_bind_param(lock_user, user_param) || mysql_stmt_execute(lock_user)) {
+        return fail(lock_user, "lock user for image upload failed: ");
+    }
+
+    unsigned long long user_id = 0;
+    MYSQL_BIND user_result[1]{};
+    user_result[0].buffer_type = MYSQL_TYPE_LONGLONG;
+    user_result[0].buffer = &user_id;
+    user_result[0].is_unsigned = 1;
+
+    if (mysql_stmt_bind_result(lock_user, user_result)) {
+        return fail(lock_user, "read upload owner failed: ");
+    }
+
+    int user_fetch = mysql_stmt_fetch(lock_user);
+    mysql_stmt_free_result(lock_user);
+
+    if (user_fetch == MYSQL_NO_DATA) {
+        mysql_rollback(connection->mysql);
+        mysql_autocommit(connection->mysql, 1);
+        release_connection(connection);
+        return { ImageReserveStatus::Error, "upload owner does not exist" };
+    }
+
+    if (user_fetch != 0 && user_fetch != MYSQL_DATA_TRUNCATED) {
+        return fail(lock_user, "read upload owner failed: ");
+    }
+
+    MYSQL_STMT* count_stmt = connection->image_count_stmt;
+    mysql_stmt_reset(count_stmt);
+
+    if (mysql_stmt_bind_param(count_stmt, user_param) || mysql_stmt_execute(count_stmt)) {
+        return fail(count_stmt, "count user images failed: ");
+    }
+
+    unsigned long long image_count = 0;
+    MYSQL_BIND count_result[1]{};
+    count_result[0].buffer_type = MYSQL_TYPE_LONGLONG;
+    count_result[0].buffer = &image_count;
+    count_result[0].is_unsigned = 1;
+
+    if (mysql_stmt_bind_result(count_stmt, count_result) ||
+        mysql_stmt_fetch(count_stmt) != 0) {
+        mysql_stmt_free_result(count_stmt);
+        return fail(count_stmt, "read user image count failed: ");
+    }
+
+    mysql_stmt_free_result(count_stmt);
+
+    if (is_cancelled()) {
+        return cancel_transaction();
+    }
+
+    if (image_count >= max_images) {
+        mysql_rollback(connection->mysql);
+        mysql_autocommit(connection->mysql, 1);
+        release_connection(connection);
+        return { ImageReserveStatus::LimitExceeded, "image count limit reached" };
+    }
+
+    MYSQL_STMT* insert_stmt = connection->image_insert_stmt;
+    mysql_stmt_reset(insert_stmt);
+    std::string values[4]{ username, stored_name, original_name, content_hash };
+    unsigned long lengths[4]{
+        static_cast<unsigned long>(username.size()),
+        static_cast<unsigned long>(stored_name.size()),
+        static_cast<unsigned long>(original_name.size()),
+        static_cast<unsigned long>(content_hash.size())
+    };
+    unsigned long long mysql_size = size_bytes;
+    MYSQL_BIND insert_params[5]{};
+
+    for (int i = 0; i < 4; ++i) {
+        insert_params[i].buffer_type = MYSQL_TYPE_STRING;
+        insert_params[i].buffer = const_cast<char*>(values[i].data());
+        insert_params[i].buffer_length = lengths[i];
+        insert_params[i].length = &lengths[i];
+    }
+
+    insert_params[4].buffer_type = MYSQL_TYPE_LONGLONG;
+    insert_params[4].buffer = &mysql_size;
+    insert_params[4].is_unsigned = 1;
+
+    if (mysql_stmt_bind_param(insert_stmt, insert_params) ||
+        mysql_stmt_execute(insert_stmt)) {
+        unsigned int error_no = mysql_stmt_errno(insert_stmt);
+
+        if (error_no == 1062) {
+            mysql_rollback(connection->mysql);
+            mysql_autocommit(connection->mysql, 1);
+            release_connection(connection);
+            return { ImageReserveStatus::Duplicate, "the same image was already uploaded by this user" };
+        }
+
+        return fail(insert_stmt, "save image metadata failed: ");
+    }
+
+    if (is_cancelled()) {
+        return cancel_transaction();
+    }
+
+    if (mysql_commit(connection->mysql) || mysql_autocommit(connection->mysql, 1)) {
+        return fail(nullptr, "commit image metadata failed: ");
+    }
+
+    release_connection(connection);
+    return { ImageReserveStatus::Ok, "image reserved" };
+#else
+    (void)username;
+    (void)stored_name;
+    (void)original_name;
+    (void)content_hash;
+    (void)size_bytes;
+    (void)max_images;
+    (void)cancelled;
+    return { ImageReserveStatus::Unavailable, status_message() };
+#endif
+}
+
+ImageDeleteResult UserStore::check_image_owner(
+    const std::string& username,
+    const std::string& stored_name,
+    const std::shared_ptr<std::atomic<bool>>& cancelled
+) {
+#ifdef MYWEBSERVER_WITH_MYSQL
+    auto is_cancelled = [&cancelled]() {
+        return cancelled && cancelled->load(std::memory_order_acquire);
+    };
+    if (is_cancelled()) {
+        return { ImageDeleteStatus::Cancelled, "request was cancelled" };
+    }
+
+    MysqlConnection* connection = acquire_connection();
+    if (!connection) {
+        return {
+            ImageDeleteStatus::Unavailable,
+            "database pool is busy or unavailable"
+        };
+    }
+
+    auto fail = [&](MYSQL_STMT* stmt, const std::string& prefix) {
+        unsigned int error_no = stmt
+            ? mysql_stmt_errno(stmt)
+            : mysql_errno(connection->mysql);
+        std::string error = stmt
+            ? mysql_stmt_error(stmt)
+            : mysql_error(connection->mysql);
+        handle_connection_failure(connection, error_no, error);
+        release_connection(connection);
+        return ImageDeleteResult{ ImageDeleteStatus::Error, prefix + error };
+    };
+
+    MYSQL_STMT* owner_stmt = connection->image_owner_stmt;
+    mysql_stmt_reset(owner_stmt);
+    unsigned long stored_length = static_cast<unsigned long>(stored_name.size());
+    MYSQL_BIND owner_param[1]{};
+    owner_param[0].buffer_type = MYSQL_TYPE_STRING;
+    owner_param[0].buffer = const_cast<char*>(stored_name.data());
+    owner_param[0].buffer_length = stored_length;
+    owner_param[0].length = &stored_length;
+    if (mysql_stmt_bind_param(owner_stmt, owner_param) ||
+        mysql_stmt_execute(owner_stmt)) {
+        return fail(owner_stmt, "read image owner failed: ");
+    }
+
+    char owner_buffer[65]{};
+    unsigned long owner_length = 0;
+    MYSQL_BIND owner_result[1]{};
+    owner_result[0].buffer_type = MYSQL_TYPE_STRING;
+    owner_result[0].buffer = owner_buffer;
+    owner_result[0].buffer_length = sizeof(owner_buffer);
+    owner_result[0].length = &owner_length;
+    if (mysql_stmt_bind_result(owner_stmt, owner_result)) {
+        return fail(owner_stmt, "read image owner failed: ");
+    }
+
+    int fetch_status = mysql_stmt_fetch(owner_stmt);
+    mysql_stmt_free_result(owner_stmt);
+    if (fetch_status == MYSQL_NO_DATA) {
+        release_connection(connection);
+        return { ImageDeleteStatus::NotFound, "image metadata not found" };
+    }
+    if (fetch_status != 0 && fetch_status != MYSQL_DATA_TRUNCATED) {
+        return fail(owner_stmt, "read image owner failed: ");
+    }
+
+    const bool owner_matches =
+        std::string(owner_buffer, owner_length) == username;
+    release_connection(connection);
+    if (is_cancelled()) {
+        return { ImageDeleteStatus::Cancelled, "request was cancelled" };
+    }
+    if (!owner_matches) {
+        return {
+            ImageDeleteStatus::Forbidden,
+            "only the uploader may delete this image"
+        };
+    }
+    return { ImageDeleteStatus::Ok, "image ownership confirmed" };
+#else
+    (void)username;
+    (void)stored_name;
+    (void)cancelled;
+    return { ImageDeleteStatus::Unavailable, status_message() };
+#endif
+}
+
+ImageDeleteResult UserStore::delete_owned_image(
+    const std::string& username,
+    const std::string& stored_name,
+    const std::shared_ptr<std::atomic<bool>>& cancelled
+) {
+#ifdef MYWEBSERVER_WITH_MYSQL
+    auto is_cancelled = [&cancelled]() {
+        return cancelled && cancelled->load(std::memory_order_acquire);
+    };
+
+    if (is_cancelled()) {
+        return { ImageDeleteStatus::Cancelled, "request was cancelled" };
+    }
+
+    MysqlConnection* connection = acquire_connection();
+
+    if (!connection) {
+        return { ImageDeleteStatus::Unavailable, "database pool is busy or unavailable" };
+    }
+
+    auto statement_error = [&](MYSQL_STMT* stmt, const std::string& prefix) {
+        unsigned int error_no = stmt
+            ? mysql_stmt_errno(stmt)
+            : mysql_errno(connection->mysql);
+        std::string error = stmt
+            ? mysql_stmt_error(stmt)
+            : mysql_error(connection->mysql);
+        mysql_rollback(connection->mysql);
+        mysql_autocommit(connection->mysql, 1);
+        handle_connection_failure(connection, error_no, error);
+        release_connection(connection);
+        return ImageDeleteResult{ ImageDeleteStatus::Error, prefix + error };
+    };
+
+    auto cancel_transaction = [&]() {
+        mysql_rollback(connection->mysql);
+        mysql_autocommit(connection->mysql, 1);
+        release_connection(connection);
+        return ImageDeleteResult{ ImageDeleteStatus::Cancelled, "request was cancelled" };
+    };
+
+    if (mysql_autocommit(connection->mysql, 0)) {
+        return statement_error(nullptr, "start image delete transaction failed: ");
+    }
+
+    if (is_cancelled()) {
+        return cancel_transaction();
+    }
+
+    MYSQL_STMT* owner_stmt = connection->image_owner_stmt;
+    mysql_stmt_reset(owner_stmt);
+    unsigned long stored_length = static_cast<unsigned long>(stored_name.size());
+    MYSQL_BIND owner_param[1]{};
+    owner_param[0].buffer_type = MYSQL_TYPE_STRING;
+    owner_param[0].buffer = const_cast<char*>(stored_name.data());
+    owner_param[0].buffer_length = stored_length;
+    owner_param[0].length = &stored_length;
+
+    if (mysql_stmt_bind_param(owner_stmt, owner_param) ||
+        mysql_stmt_execute(owner_stmt)) {
+        return statement_error(owner_stmt, "read image owner failed: ");
+    }
+
+    char owner_buffer[65]{};
+    unsigned long owner_length = 0;
+    MYSQL_BIND owner_result[1]{};
+    owner_result[0].buffer_type = MYSQL_TYPE_STRING;
+    owner_result[0].buffer = owner_buffer;
+    owner_result[0].buffer_length = sizeof(owner_buffer);
+    owner_result[0].length = &owner_length;
+
+    if (mysql_stmt_bind_result(owner_stmt, owner_result)) {
+        return statement_error(owner_stmt, "read image owner failed: ");
+    }
+
+    int fetch_status = mysql_stmt_fetch(owner_stmt);
+    mysql_stmt_free_result(owner_stmt);
+
+    if (fetch_status == MYSQL_NO_DATA) {
+        mysql_rollback(connection->mysql);
+        mysql_autocommit(connection->mysql, 1);
+        release_connection(connection);
+        return { ImageDeleteStatus::NotFound, "image metadata not found" };
+    }
+
+    if (fetch_status != 0 && fetch_status != MYSQL_DATA_TRUNCATED) {
+        return statement_error(owner_stmt, "read image owner failed: ");
+    }
+
+    if (std::string(owner_buffer, owner_length) != username) {
+        mysql_rollback(connection->mysql);
+        mysql_autocommit(connection->mysql, 1);
+        release_connection(connection);
+        return { ImageDeleteStatus::Forbidden, "only the uploader may delete this image" };
+    }
+
+    if (is_cancelled()) {
+        return cancel_transaction();
+    }
+
+    MYSQL_STMT* delete_stmt = connection->image_delete_stmt;
+    mysql_stmt_reset(delete_stmt);
+    std::string values[2]{ username, stored_name };
+    unsigned long lengths[2]{
+        static_cast<unsigned long>(username.size()),
+        static_cast<unsigned long>(stored_name.size())
+    };
+    MYSQL_BIND delete_params[2]{};
+
+    for (int i = 0; i < 2; ++i) {
+        delete_params[i].buffer_type = MYSQL_TYPE_STRING;
+        delete_params[i].buffer = const_cast<char*>(values[i].data());
+        delete_params[i].buffer_length = lengths[i];
+        delete_params[i].length = &lengths[i];
+    }
+
+    if (mysql_stmt_bind_param(delete_stmt, delete_params) ||
+        mysql_stmt_execute(delete_stmt)) {
+        return statement_error(delete_stmt, "delete image metadata failed: ");
+    }
+
+    if (mysql_stmt_affected_rows(delete_stmt) == 0) {
+        mysql_rollback(connection->mysql);
+        mysql_autocommit(connection->mysql, 1);
+        release_connection(connection);
+        return { ImageDeleteStatus::NotFound, "image metadata not found" };
+    }
+
+    if (is_cancelled()) {
+        return cancel_transaction();
+    }
+
+    if (mysql_commit(connection->mysql)) {
+        const unsigned int error_no = mysql_errno(connection->mysql);
+        const std::string error = mysql_error(connection->mysql);
+        // The server may have committed immediately before the connection was
+        // lost. Do not report an ordinary failure: the caller must resolve the
+        // outcome with a fresh ownership read before restoring the file.
+        mysql_autocommit(connection->mysql, 1);
+        handle_connection_failure(connection, error_no, error);
+        release_connection(connection);
+        return {
+            ImageDeleteStatus::CommitUnknown,
+            "image delete commit outcome is unknown: " + error
+        };
+    }
+
+    if (mysql_autocommit(connection->mysql, 1)) {
+        const std::string error = mysql_error(connection->mysql);
+        // COMMIT already succeeded. Retire/repair this slot, but never make the
+        // upper layer restore a file whose database row is gone.
+        handle_connection_failure(connection, 2006, error);
+        release_connection(connection);
+        return {
+            ImageDeleteStatus::Ok,
+            "image metadata deleted; database connection was repaired"
+        };
+    }
+
+    release_connection(connection);
+    return { ImageDeleteStatus::Ok, "image metadata deleted" };
+#else
+    (void)username;
+    (void)stored_name;
+    (void)cancelled;
+    return { ImageDeleteStatus::Unavailable, status_message() };
 #endif
 }
 
@@ -641,15 +1210,22 @@ MysqlConnection* UserStore::acquire_connection() {
     }
 
     std::unique_lock<std::mutex> lock(mutex_);
-    pool_cv_.wait(lock, [this]() {
+    bool ready = pool_cv_.wait_for(
+        lock,
+        std::chrono::milliseconds(pool_wait_timeout_ms_),
+        [this]() {
         return !pool_available_.load(std::memory_order_acquire) ||
             has_idle_connection();
-    });
+        }
+    );
 
-    if (!pool_available_.load(std::memory_order_acquire)) {
+    if (!ready || !pool_available_.load(std::memory_order_acquire)) {
         return nullptr;
     }
 
+    // try_acquire_connection may repair a broken slot. Repair updates pool
+    // status and locks mutex_, so never call it while holding mutex_.
+    lock.unlock();
     return try_acquire_connection();
 }
 
@@ -835,10 +1411,20 @@ bool UserStore::repair_connection(
     connection->mysql = replacement->mysql;
     connection->register_stmt = replacement->register_stmt;
     connection->login_stmt = replacement->login_stmt;
+    connection->image_lock_user_stmt = replacement->image_lock_user_stmt;
+    connection->image_count_stmt = replacement->image_count_stmt;
+    connection->image_insert_stmt = replacement->image_insert_stmt;
+    connection->image_owner_stmt = replacement->image_owner_stmt;
+    connection->image_delete_stmt = replacement->image_delete_stmt;
 
     replacement->mysql = nullptr;
     replacement->register_stmt = nullptr;
     replacement->login_stmt = nullptr;
+    replacement->image_lock_user_stmt = nullptr;
+    replacement->image_count_stmt = nullptr;
+    replacement->image_insert_stmt = nullptr;
+    replacement->image_owner_stmt = nullptr;
+    replacement->image_delete_stmt = nullptr;
     delete replacement;
 
     if (!connection->healthy.exchange(true, std::memory_order_acq_rel)) {
@@ -863,6 +1449,21 @@ void UserStore::reset_connection(MysqlConnection* connection) const {
     if (connection->login_stmt) {
         mysql_stmt_close(connection->login_stmt);
         connection->login_stmt = nullptr;
+    }
+
+    MYSQL_STMT** image_statements[] = {
+        &connection->image_lock_user_stmt,
+        &connection->image_count_stmt,
+        &connection->image_insert_stmt,
+        &connection->image_owner_stmt,
+        &connection->image_delete_stmt
+    };
+
+    for (MYSQL_STMT** statement : image_statements) {
+        if (*statement) {
+            mysql_stmt_close(*statement);
+            *statement = nullptr;
+        }
     }
 
     if (connection->mysql) {
@@ -925,6 +1526,58 @@ bool UserStore::prepare_statements(
         return false;
     }
 
+    struct StatementSpec {
+        MYSQL_STMT** target;
+        const char* sql;
+        const char* name;
+    };
+
+    StatementSpec image_statements[] = {
+        {
+            &connection->image_lock_user_stmt,
+            "SELECT id FROM users WHERE username = ? FOR UPDATE",
+            "image lock user"
+        },
+        {
+            &connection->image_count_stmt,
+            "SELECT COUNT(*) FROM images WHERE owner_username = ?",
+            "image count"
+        },
+        {
+            &connection->image_insert_stmt,
+            "INSERT INTO images(owner_username, stored_name, original_name, content_hash, size_bytes) VALUES (?, ?, ?, ?, ?)",
+            "image insert"
+        },
+        {
+            &connection->image_owner_stmt,
+            "SELECT owner_username FROM images WHERE stored_name = ? LIMIT 1 FOR UPDATE",
+            "image owner"
+        },
+        {
+            &connection->image_delete_stmt,
+            "DELETE FROM images WHERE owner_username = ? AND stored_name = ?",
+            "image delete"
+        }
+    };
+
+    for (const StatementSpec& spec : image_statements) {
+        *spec.target = mysql_stmt_init(connection->mysql);
+
+        if (!*spec.target) {
+            error = std::string("mysql_stmt_init ") + spec.name + " failed";
+            return false;
+        }
+
+        if (mysql_stmt_prepare(
+            *spec.target,
+            spec.sql,
+            static_cast<unsigned long>(std::strlen(spec.sql))
+        )) {
+            error = mysql_stmt_error(*spec.target);
+            return false;
+        }
+    }
+
     return true;
 }
 
@@ -942,6 +1595,28 @@ bool UserStore::ensure_schema(MysqlConnection* connection) {
     if (mysql_query(connection->mysql, sql)) {
         std::lock_guard<std::mutex> lock(mutex_);
         status_message_ = "create users table failed: " +
+            std::string(mysql_error(connection->mysql));
+        return false;
+    }
+
+    const char* image_sql =
+        "CREATE TABLE IF NOT EXISTS images ("
+        "id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,"
+        "owner_username VARCHAR(64) NOT NULL,"
+        "stored_name VARCHAR(255) NOT NULL UNIQUE,"
+        "original_name VARCHAR(255) NOT NULL,"
+        "content_hash CHAR(64) NOT NULL,"
+        "size_bytes BIGINT UNSIGNED NOT NULL,"
+        "created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+        "UNIQUE KEY uq_images_owner_hash(owner_username, content_hash),"
+        "KEY idx_images_owner(owner_username),"
+        "CONSTRAINT fk_images_owner FOREIGN KEY(owner_username) "
+        "REFERENCES users(username) ON DELETE CASCADE"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
+
+    if (mysql_query(connection->mysql, image_sql)) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        status_message_ = "create images table failed: " +
             std::string(mysql_error(connection->mysql));
         return false;
     }

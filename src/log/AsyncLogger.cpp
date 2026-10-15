@@ -1,5 +1,7 @@
 #include "log/AsyncLogger.h"
 
+#include "utils/Metrics.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
@@ -30,6 +32,20 @@ void AsyncLogger::init(const std::string& file_path) {
         min_level_.store(level_value(configured_level), std::memory_order_relaxed);
     }
 
+    const char* configured_queue_size = std::getenv("LOG_QUEUE_CAPACITY");
+
+    if (configured_queue_size && configured_queue_size[0] != '\0') {
+        size_t parsed = static_cast<size_t>(std::strtoull(
+            configured_queue_size,
+            nullptr,
+            10
+        ));
+
+        if (parsed > 0) {
+            max_queue_size_ = parsed;
+        }
+    }
+
     file_.open(file_path, std::ios::app);
 
     if (!file_.is_open()) {
@@ -56,6 +72,12 @@ void AsyncLogger::log(const std::string& level, const std::string& message) {
 
         if (!running_) {
             std::cerr << oss.str();
+            return;
+        }
+
+        if (queue_.size() >= max_queue_size_) {
+            dropped_logs_.fetch_add(1, std::memory_order_relaxed);
+            Metrics::instance().inc_dropped_log();
             return;
         }
 
@@ -121,6 +143,20 @@ void AsyncLogger::worker_loop() {
             }
 
             local_queue.pop();
+        }
+
+        uint64_t dropped = dropped_logs_.exchange(0, std::memory_order_relaxed);
+
+        if (dropped > 0) {
+            std::string line = "[WARN] async log queue was full; dropped " +
+                std::to_string(dropped) + " log records\n";
+
+            if (file_.is_open()) {
+                file_ << line;
+            }
+            else {
+                std::cerr << line;
+            }
         }
 
         if (file_.is_open()) {

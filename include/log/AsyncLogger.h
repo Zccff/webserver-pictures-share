@@ -33,11 +33,13 @@ private:
 
 private:
     std::atomic<int> min_level_{ 0 };
+    std::atomic<uint64_t> dropped_logs_{ 0 };
     mutable std::mutex mutex_;
     std::condition_variable cv_;
     std::queue<std::string> queue_;
     std::ofstream file_;
     std::thread worker_;
+    size_t max_queue_size_{ 8192 };
     bool running_{ false };
 };
 

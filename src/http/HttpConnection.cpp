@@ -20,11 +20,25 @@ constexpr size_t READ_BUFFER_SIZE = 4096;
 
 }
 
-HttpConnection::HttpConnection(int fd, uint64_t generation)
-    : fd_(fd), generation_(generation) {
+HttpConnection::HttpConnection(
+    int fd,
+    uint64_t generation,
+    std::string upload_temp_dir
+)
+    : fd_(fd),
+    generation_(generation),
+    cancelled_(std::make_shared<std::atomic<bool>>(false)),
+    upload_temp_dir_(std::move(upload_temp_dir)) {
+    if (upload_temp_dir_.empty()) {
+        const char* configured = std::getenv("UPLOAD_TEMP_DIRECTORY");
+        upload_temp_dir_ = configured && *configured
+            ? configured
+            : "/tmp/myweb-upload";
+    }
 }
 
 HttpConnection::~HttpConnection() {
+    reset_streamed_upload(true);
     if (send_file_fd_ >= 0) {
         close(send_file_fd_);
     }
@@ -38,7 +52,15 @@ uint64_t HttpConnection::generation() const {
     return generation_;
 }
 
-HttpConnection::ReadStatus HttpConnection::read_request(HttpRequest& request) {
+std::shared_ptr<std::atomic<bool>> HttpConnection::cancellation_token() const {
+    return cancelled_;
+}
+
+void HttpConnection::cancel_work() {
+    cancelled_->store(true, std::memory_order_release);
+}
+
+HttpConnection::ReadStatus HttpConnection::read_request_buffered(HttpRequest& request) {
     char buffer[READ_BUFFER_SIZE];
 
     while (true) {
@@ -193,6 +215,7 @@ bool HttpConnection::complete_request_size(size_t& request_size) const {
     std::istringstream stream(headers);
     std::string line;
     size_t content_length = 0;
+    bool saw_content_length = false;
 
     while (std::getline(stream, line)) {
         if (!line.empty() && line.back() == '\r') {
@@ -211,9 +234,18 @@ bool HttpConnection::complete_request_size(size_t& request_size) const {
             ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
         }
 
+        if (key == "transfer-encoding") {
+            request_size = MAX_REQUEST_SIZE + 1;
+            return true;
+        }
         if (key != "content-length") {
             continue;
         }
+        if (saw_content_length) {
+            request_size = MAX_REQUEST_SIZE + 1;
+            return true;
+        }
+        saw_content_length = true;
 
         std::string value = line.substr(colon_pos + 1);
         char* end = nullptr;
@@ -232,7 +264,6 @@ bool HttpConnection::complete_request_size(size_t& request_size) const {
         }
 
         content_length = static_cast<size_t>(parsed);
-        break;
     }
 
     if (content_length > MAX_REQUEST_SIZE ||

@@ -2,11 +2,13 @@
 
 #include "cache/LRUCache.h"
 #include "http/HttpConnection.h"
+#include "server/ClientEventPolicy.h"
 #include "server/Epoller.h"
 #include "threadpool/ThreadPool.h"
 #include "timer/HeapTimer.h"
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -33,7 +35,7 @@ public:
 
     void stop();
 
-    void enqueue_connection(int client_fd);
+    bool enqueue_connection(int client_fd);
 
 private:
     struct Completion {
@@ -46,11 +48,12 @@ private:
         bool close_only{ false };
     };
 
-    static constexpr int CONNECTION_TIMEOUT_MS = 60000;
+    static constexpr int DEFAULT_CONNECTION_TIMEOUT_MS = 60000;
+    static constexpr int DEFAULT_BUSINESS_TIMEOUT_MS = 15000;
     static constexpr uint32_t CLIENT_READ_EVENTS =
-        EPOLLIN | EPOLLRDHUP | EPOLLONESHOT;
+        ClientEventPolicy::READ_EVENTS;
     static constexpr uint32_t CLIENT_WRITE_EVENTS =
-        EPOLLOUT | EPOLLRDHUP | EPOLLONESHOT;
+        ClientEventPolicy::WRITE_EVENTS;
 
     void run();
 
@@ -81,9 +84,15 @@ private:
 
     void enqueue_completion(Completion completion);
 
+    static std::string overload_response(bool keep_alive);
+
+    static std::string bad_request_response();
+
     void apply_completion(Completion completion);
 
     void refresh_timer(int client_fd, uint64_t generation);
+
+    void arm_business_timer(int client_fd, uint64_t generation);
 
     void close_connection(int client_fd, uint64_t generation);
 
@@ -105,9 +114,16 @@ private:
 
     std::mutex pending_mutex_;
     std::queue<int> pending_connections_;
+    std::atomic<size_t> owned_connection_count_{ 0 };
+    size_t max_connections_{ 4096 };
+    size_t max_pending_connections_{ 1024 };
+    int connection_timeout_ms_{ DEFAULT_CONNECTION_TIMEOUT_MS };
+    int business_timeout_ms_{ DEFAULT_BUSINESS_TIMEOUT_MS };
 
     std::mutex completion_mutex_;
+    std::condition_variable completion_not_full_cv_;
     std::queue<Completion> completions_;
+    size_t max_completions_{ 4096 };
 
     uint64_t next_generation_{ 1 };
     std::unordered_map<int, std::unique_ptr<HttpConnection>> connections_;

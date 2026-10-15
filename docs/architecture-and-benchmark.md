@@ -10,7 +10,8 @@ flowchart LR
     WebServer --> StaticFiles["Static files\nwebroot/"]
     WebServer --> ImageVolume["Image storage\nwebroot/images"]
     WebServer --> MySQL["MySQL\nusers table"]
-    WebServer --> Redis["Redis\nsession:{token} + TTL"]
+    WebServer --> RedisLoop["Async Redis client\nhiredis + libuv"]
+    RedisLoop --> Redis["Redis\nsession:{token} + TTL"]
 
     WebServer --> Metrics["/metrics\nconnections / requests / cache"]
     WebServer --> Logger["AsyncLogger\nserver.log"]
@@ -43,11 +44,11 @@ sequenceDiagram
     else Register / login
         S->>M: prepared statement
         M-->>S: user result
-        S->>R: SETEX session token
-        R-->>S: OK
+    S-->>R: async SETEX session token
+    R-->>S: OK
         S-->>N: JSON + Set-Cookie
     else Authenticated API
-        S->>R: GET session token
+        S-->>R: async GET session token
         R-->>S: session payload
         S-->>N: JSON / image data
     end
@@ -75,7 +76,9 @@ flowchart TD
 
     Response --> Cache["LRUCache\nstatic file cache"]
     Response --> UserStore["UserStore\nMySQL"]
-    Response --> SessionMgr["SessionManager\nRedis RESP"]
+    Response --> SessionMgr["AsyncSessionManager\nhiredis async + libuv"]
+    SessionMgr --> Continuation["Redis callback\nresubmit continuation"]
+    Continuation --> Worker
     Response --> Completion["completion queue + eventfd"]
 
     Completion --> OwnerSub["owning Sub Reactor"]
@@ -105,9 +108,18 @@ the owning Sub through a queue and `eventfd` wakeup.
 Both epoll events and worker completions carry a connection generation, preventing a
 late event from acting on a reused numeric fd.
 
-The timer uses a min-heap plus lazy deletion. Each active connection has an expire
-time. When a request is processed successfully, the expire time is refreshed. When
-the timeout fires, the callback closes the idle connection.
+The timer uses a min-heap plus lazy deletion. An incomplete or keep-alive connection
+uses the configurable idle timeout. Once a complete request is submitted, the timer
+is changed to the business timeout. Expiration closes the connection and sets a
+shared cancellation token; worker continuations stop, and upload/register/delete
+transactions check that token before commit. MySQL calls already executing inside
+the client library are bounded by their own I/O timeout because cooperative
+cancellation cannot interrupt an arbitrary blocking C API call safely.
+
+Every overload-sensitive buffer is bounded: accepted connections per Sub Reactor,
+pending fd dispatch, worker tasks, response completions, Redis commands and pipeline
+depth, log records, and process-local caches. Queue-full paths reject early and are
+visible through `/metrics` instead of consuming memory without limit.
 
 ## Benchmark Guide
 
@@ -126,7 +138,7 @@ Local mode:
 
 ```bash
 cd MyWebServer
-cmake -S . -B build
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ./build/my_web_server 9006 ./webroot 6
 curl http://127.0.0.1:9006/

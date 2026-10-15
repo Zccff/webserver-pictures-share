@@ -1,9 +1,9 @@
 #pragma once
 
 #include <chrono>
+#include <cstddef>
 #include <functional>
 #include <mutex>
-#include <queue>
 #include <unordered_map>
 #include <vector>
 
@@ -19,6 +19,8 @@ public:
 
     int get_next_timeout_ms();
 
+    size_t size() const;
+
 private:
     using Clock = std::chrono::steady_clock;
 
@@ -26,20 +28,19 @@ private:
         int fd;
         Clock::time_point expire;
         TimeoutCallback cb;
-
-        bool operator>(const TimerNode& other) const {
-            return expire > other.expire;
-        }
     };
 
+    void swap_nodes(size_t lhs, size_t rhs);
+
+    void sift_up(size_t index);
+
+    void sift_down(size_t index);
+
+    void erase_at(size_t index);
+
 private:
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
 
-    std::priority_queue<
-        TimerNode,
-        std::vector<TimerNode>,
-        std::greater<TimerNode>
-    > heap_;
-
-    std::unordered_map<int, Clock::time_point> expires_;
+    std::vector<TimerNode> heap_;
+    std::unordered_map<int, size_t> indices_;
 };

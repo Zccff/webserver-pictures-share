@@ -10,7 +10,10 @@
 
 class ThreadPool {
 public:
-    explicit ThreadPool(size_t thread_count = std::thread::hardware_concurrency()) {
+    explicit ThreadPool(
+        size_t thread_count = std::thread::hardware_concurrency(),
+        size_t max_queue_size = 4096
+    ) : max_queue_size_(max_queue_size == 0 ? 1 : max_queue_size) {
         if (thread_count == 0) {
             thread_count = 4;
         }
@@ -48,18 +51,25 @@ public:
     ThreadPool(const ThreadPool&) = delete;
     ThreadPool& operator=(const ThreadPool&) = delete;
 
-    void submit(std::function<void()> task) {
+    bool try_submit(std::function<void()> task) {
         {
             std::lock_guard<std::mutex> lock(mutex_);
 
-            if (stopped_) {
-                throw std::runtime_error("submit on stopped ThreadPool");
+            if (stopped_ || tasks_.size() >= max_queue_size_) {
+                return false;
             }
 
             tasks_.push(std::move(task));
         }
 
         cv_.notify_one();
+        return true;
+    }
+
+    void submit(std::function<void()> task) {
+        if (!try_submit(std::move(task))) {
+            throw std::runtime_error("ThreadPool is stopped or its queue is full");
+        }
     }
 
     size_t queue_size() const {
@@ -92,5 +102,6 @@ private:
     std::condition_variable cv_;
     std::queue<std::function<void()>> tasks_;
     std::vector<std::thread> workers_;
+    size_t max_queue_size_;
     bool stopped_{ false };
 };

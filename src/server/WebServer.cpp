@@ -7,12 +7,39 @@
 #include <cerrno>
 #include <chrono>
 #include <cstring>
+#include <cstdlib>
 #include <iostream>
 #include <sstream>
 #include <sys/socket.h>
 #include <thread>
 #include <unistd.h>
 #include <utility>
+
+namespace {
+
+size_t worker_queue_capacity() {
+    const char* value = std::getenv("WORKER_QUEUE_CAPACITY");
+
+    if (!value || value[0] == '\0') {
+        return 4096;
+    }
+
+    size_t parsed = static_cast<size_t>(std::strtoull(value, nullptr, 10));
+    return parsed == 0 ? 4096 : parsed;
+}
+
+int listen_backlog() {
+    const char* value = std::getenv("LISTEN_BACKLOG");
+
+    if (!value || value[0] == '\0') {
+        return 1024;
+    }
+
+    int parsed = std::atoi(value);
+    return parsed > 0 ? parsed : 1024;
+}
+
+}
 
 WebServer::WebServer(
     int port,
@@ -22,7 +49,7 @@ WebServer::WebServer(
     : port_(port),
     web_root_(std::move(web_root)),
     file_cache_(10 * 1024 * 1024),
-    worker_pool_(worker_count) {
+    worker_pool_(worker_count, worker_queue_capacity()) {
 }
 
 WebServer::~WebServer() {
@@ -31,15 +58,15 @@ WebServer::~WebServer() {
         listen_fd_ = -1;
     }
 
-    worker_pool_.stop();
-
     for (auto& sub : sub_reactors_) {
         sub->stop();
     }
+
+    worker_pool_.stop();
 }
 
 bool WebServer::init() {
-    listen_fd_ = SocketUtil::create_listen_fd(port_);
+    listen_fd_ = SocketUtil::create_listen_fd(port_, listen_backlog());
 
     if (listen_fd_ < 0) {
         return false;
@@ -113,7 +140,12 @@ void WebServer::start() {
 
         SubReactor& target = *sub_reactors_[next_sub_];
         next_sub_ = (next_sub_ + 1) % sub_reactors_.size();
-        target.enqueue_connection(client_fd);
+        bool accepted = target.enqueue_connection(client_fd);
+
+        if (!accepted) {
+            LOG_WARN("connection rejected because sub reactor is full");
+            continue;
+        }
 
         if (AsyncLogger::instance().should_log("INFO")) {
             char client_ip[INET_ADDRSTRLEN]{};

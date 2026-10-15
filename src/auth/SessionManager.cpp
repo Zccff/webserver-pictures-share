@@ -7,12 +7,15 @@
 #include <cstdlib>
 #include <cstring>
 #include <iomanip>
+#include <fcntl.h>
 #include <netdb.h>
+#include <poll.h>
 #include <random>
 #include <sstream>
 #include <string>
 #include <sys/socket.h>
 #include <sys/random.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 namespace {
@@ -42,6 +45,8 @@ SessionManager& SessionManager::instance() {
 bool SessionManager::init_from_env() {
     int configured_pool_size = env_int_or_default("REDIS_POOL_SIZE", 8);
     int configured_cache_ttl = env_int_or_default("SESSION_CACHE_TTL_SECONDS", 3);
+    int configured_cache_capacity = env_int_or_default("SESSION_CACHE_CAPACITY", 20000);
+    int configured_io_timeout = env_int_or_default("REDIS_IO_TIMEOUT_MS", 3000);
 
     if (configured_pool_size <= 0) {
         configured_pool_size = 8;
@@ -49,6 +54,14 @@ bool SessionManager::init_from_env() {
 
     if (configured_cache_ttl < 0) {
         configured_cache_ttl = 0;
+    }
+
+    if (configured_cache_capacity <= 0) {
+        configured_cache_capacity = 20000;
+    }
+
+    if (configured_io_timeout <= 0) {
+        configured_io_timeout = 3000;
     }
 
     {
@@ -65,6 +78,8 @@ bool SessionManager::init_from_env() {
 
         pool_size_ = configured_pool_size;
         cache_ttl_seconds_ = configured_cache_ttl;
+        cache_capacity_ = static_cast<size_t>(configured_cache_capacity);
+        io_timeout_ms_ = configured_io_timeout;
         available_ = false;
         status_message_ = "redis session store is connecting";
         connections_.clear();
@@ -213,40 +228,60 @@ bool SessionManager::command_with_retry(
     const std::initializer_list<std::string>& args,
     std::string& response
 ) const {
-    RedisConnection* connection = pick_connection();
-
-    if (!connection) {
+    if (connections_.empty()) {
         set_status(false, "redis connection pool is empty");
         return false;
     }
 
     for (int attempt = 0; attempt < 2; ++attempt) {
-        std::lock_guard<std::mutex> lock(connection->mutex);
+        size_t start = next_connection_.fetch_add(1, std::memory_order_relaxed);
+        bool tried_connection = false;
 
-        if (connection->fd < 0 && !connect_locked(*connection)) {
+        for (size_t i = 0; i < connections_.size(); ++i) {
+            RedisConnection& connection =
+                *connections_[(start + i) % connections_.size()];
+            std::unique_lock<std::mutex> lock(connection.mutex, std::try_to_lock);
+
+            if (!lock.owns_lock()) {
+                continue;
+            }
+
+            tried_connection = true;
+
+            if (connection.fd < 0 && !connect_locked(connection)) {
+                continue;
+            }
+
+            if (command_locked(connection, args, response)) {
+                set_status(true, "redis connected");
+                return true;
+            }
+
+            close_connection_locked(connection);
+        }
+
+        if (tried_connection) {
             continue;
         }
 
-        if (command_locked(*connection, args, response)) {
+        // Every slot was busy. Wait on one rotating slot instead of queuing
+        // behind the originally selected connection while another slot frees.
+        RedisConnection& connection = *connections_[start % connections_.size()];
+        std::unique_lock<std::mutex> lock(connection.mutex);
+
+        if (connection.fd < 0 && !connect_locked(connection)) {
+            continue;
+        }
+
+        if (command_locked(connection, args, response)) {
             set_status(true, "redis connected");
             return true;
         }
 
-        close_connection_locked(*connection);
+        close_connection_locked(connection);
     }
 
     return false;
-}
-
-SessionManager::RedisConnection* SessionManager::pick_connection() const {
-    if (connections_.empty()) {
-        return nullptr;
-    }
-
-    size_t index = next_connection_.fetch_add(1, std::memory_order_relaxed) %
-        connections_.size();
-
-    return connections_[index].get();
 }
 
 bool SessionManager::connect_locked(RedisConnection& connection) const {
@@ -275,7 +310,43 @@ bool SessionManager::connect_locked(RedisConnection& connection) const {
             continue;
         }
 
-        if (connect(connected_fd, rp->ai_addr, rp->ai_addrlen) == 0) {
+        int old_flags = fcntl(connected_fd, F_GETFL, 0);
+
+        if (old_flags >= 0) {
+            fcntl(connected_fd, F_SETFL, old_flags | O_NONBLOCK);
+        }
+
+        int connect_result = connect(connected_fd, rp->ai_addr, rp->ai_addrlen);
+        bool connected = connect_result == 0;
+
+        if (!connected && errno == EINPROGRESS) {
+            pollfd descriptor{};
+            descriptor.fd = connected_fd;
+            descriptor.events = POLLOUT;
+            int poll_result;
+
+            do {
+                poll_result = poll(&descriptor, 1, io_timeout_ms_);
+            } while (poll_result < 0 && errno == EINTR);
+
+            if (poll_result > 0) {
+                int socket_error = 0;
+                socklen_t error_length = sizeof(socket_error);
+                connected = getsockopt(
+                    connected_fd,
+                    SOL_SOCKET,
+                    SO_ERROR,
+                    &socket_error,
+                    &error_length
+                ) == 0 && socket_error == 0;
+            }
+        }
+
+        if (old_flags >= 0) {
+            fcntl(connected_fd, F_SETFL, old_flags);
+        }
+
+        if (connected) {
             break;
         }
 
@@ -291,6 +362,12 @@ bool SessionManager::connect_locked(RedisConnection& connection) const {
     }
 
     connection.fd = connected_fd;
+
+    timeval timeout{};
+    timeout.tv_sec = io_timeout_ms_ / 1000;
+    timeout.tv_usec = (io_timeout_ms_ % 1000) * 1000;
+    setsockopt(connection.fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    setsockopt(connection.fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 
     if (!password_.empty()) {
         std::string response;
@@ -524,6 +601,24 @@ void SessionManager::put_cached_session(
     }
 
     std::unique_lock<std::shared_mutex> lock(cache_mutex_);
+
+    if (session_cache_.size() >= cache_capacity_ &&
+        session_cache_.find(token) == session_cache_.end()) {
+        auto now = std::chrono::steady_clock::now();
+
+        for (auto it = session_cache_.begin(); it != session_cache_.end();) {
+            if (now >= it->second.expires_at) {
+                it = session_cache_.erase(it);
+            }
+            else {
+                ++it;
+            }
+        }
+
+        if (session_cache_.size() >= cache_capacity_) {
+            session_cache_.erase(session_cache_.begin());
+        }
+    }
 
     session_cache_[token] = {
         session,
